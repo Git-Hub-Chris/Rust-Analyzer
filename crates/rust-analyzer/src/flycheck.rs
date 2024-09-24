@@ -5,6 +5,7 @@ use std::{fmt, io, process::Command, time::Duration};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
+use project_model::{project_json, TargetKind};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -35,12 +36,61 @@ pub(crate) struct CargoOptions {
     pub(crate) target_dir: Option<Utf8PathBuf>,
 }
 
-#[derive(Clone)]
-pub(crate) enum Target {
+/// `--bin rust-analyzer`, `--example example-1`, `--bench microbenchmark`, `--test integrationtest2`
+#[derive(Clone, Debug)]
+pub(crate) enum BinTarget {
+    /// --bin rust-analyzer
     Bin(String),
+    /// --example example
     Example(String),
-    Benchmark(String),
+    /// -- bench microbenchmark
+    Bench(String),
+    /// --test integrationtest2
     Test(String),
+}
+
+impl BinTarget {
+    pub(crate) fn from_target_kind(kind: TargetKind, name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        Some(match kind {
+            TargetKind::Bin => BinTarget::Bin(name),
+            TargetKind::Example => BinTarget::Example(name),
+            TargetKind::Bench => BinTarget::Bench(name),
+            TargetKind::Test => BinTarget::Test(name),
+            _ => return None,
+        })
+    }
+
+    /// For e.g. this crate, we have `rust-analyzer` as the package name, and
+    /// `rust-analyzer` as the binary target name. This is the latter, the
+    /// binary target name.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            BinTarget::Bin(it)
+            | BinTarget::Example(it)
+            | BinTarget::Bench(it)
+            | BinTarget::Test(it) => it,
+        }
+    }
+
+    #[allow(unused)]
+    pub(crate) fn target_kind(&self) -> TargetKind {
+        match self {
+            BinTarget::Bin(_) => TargetKind::Bin,
+            BinTarget::Example(_) => TargetKind::Example,
+            BinTarget::Bench(_) => TargetKind::Bench,
+            BinTarget::Test(_) => TargetKind::Test,
+        }
+    }
+
+    pub(crate) fn append_cargo_arg<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        match self {
+            BinTarget::Bin(it) => cmd.arg("--bin").arg(it),
+            BinTarget::Example(it) => cmd.arg("--example").arg(it),
+            BinTarget::Bench(it) => cmd.arg("--bench").arg(it),
+            BinTarget::Test(it) => cmd.arg("--test").arg(it),
+        }
+    }
 }
 
 impl CargoOptions {
@@ -69,6 +119,28 @@ impl CargoOptions {
     }
 }
 
+/// The flycheck config from a rust-project.json file
+#[derive(Debug, Default)]
+pub(crate) struct FlycheckConfigJson {
+    // XXX: unimplemented because not all that important> nobody
+    // doing custom rust-project.json needs it most likely
+    // pub workspace_template: Option<project_json::Runnable>,
+    //
+    /// The template with [project_json::RunnableKind::Flycheck]
+    pub single_template: Option<project_json::Runnable>,
+}
+
+impl FlycheckConfigJson {
+    pub(crate) fn any_configured(&self) -> bool {
+        // self.workspace_template.is_some() ||
+        self.single_template.is_some()
+    }
+}
+
+/// The flycheck config from rust-analyzer's own configuration.
+///
+/// We rely on this when rust-project.json does not specify a flycheck runnable
+///
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FlycheckConfig {
     CargoCommand {
@@ -105,6 +177,10 @@ pub(crate) struct FlycheckHandle {
     sender: Sender<StateChange>,
     _thread: stdx::thread::JoinHandle,
     id: usize,
+
+    /// Bit hacky, but this lets us force the use of restart_for_package when the flycheck
+    /// configuration does not support restart_workspace.
+    cannot_run_workspace: bool,
 }
 
 impl FlycheckHandle {
@@ -112,29 +188,49 @@ impl FlycheckHandle {
         id: usize,
         sender: Sender<FlycheckMessage>,
         config: FlycheckConfig,
+        config_json: FlycheckConfigJson,
         sysroot_root: Option<AbsPathBuf>,
         workspace_root: AbsPathBuf,
         manifest_path: Option<AbsPathBuf>,
     ) -> FlycheckHandle {
-        let actor =
-            FlycheckActor::new(id, sender, config, sysroot_root, workspace_root, manifest_path);
+        let actor = FlycheckActor::new(
+            id,
+            sender,
+            config,
+            config_json,
+            sysroot_root,
+            workspace_root,
+            manifest_path,
+        );
+
+        let cannot_run_workspace = actor.cannot_run_workspace();
+
         let (sender, receiver) = unbounded::<StateChange>();
         let thread = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker)
             .name("Flycheck".to_owned())
             .spawn(move || actor.run(receiver))
             .expect("failed to spawn thread");
-        FlycheckHandle { id, sender, _thread: thread }
+        FlycheckHandle { id, sender, _thread: thread, cannot_run_workspace }
     }
 
     /// Schedule a re-start of the cargo check worker to do a workspace wide check.
     pub(crate) fn restart_workspace(&self, saved_file: Option<AbsPathBuf>) {
-        self.sender.send(StateChange::Restart { package: None, saved_file, target: None }).unwrap();
+        self.sender
+            .send(StateChange::Restart { package: PackageToRestart::All, saved_file })
+            .unwrap();
+    }
+
+    pub(crate) fn cannot_run_workspace(&self) -> bool {
+        self.cannot_run_workspace
     }
 
     /// Schedule a re-start of the cargo check worker to do a package wide check.
-    pub(crate) fn restart_for_package(&self, package: String, target: Option<Target>) {
+    pub(crate) fn restart_for_package(&self, package: PackageSpecifier) {
         self.sender
-            .send(StateChange::Restart { package: Some(package), saved_file: None, target })
+            .send(StateChange::Restart {
+                package: PackageToRestart::Package(package),
+                saved_file: None,
+            })
             .unwrap();
     }
 
@@ -184,15 +280,52 @@ impl fmt::Debug for FlycheckMessage {
 
 #[derive(Debug)]
 pub(crate) enum Progress {
-    DidStart,
+    DidStart {
+        /// The user sees this in VSCode, etc. May be a shortened version of the command we actually
+        /// executed, otherwise it is way too long.
+        user_facing_command: String,
+    },
     DidCheckCrate(String),
     DidFinish(io::Result<()>),
     DidCancel,
     DidFailToRestart(String),
 }
 
+#[derive(Debug, Clone)]
+enum PackageToRestart {
+    All,
+    // Either a cargo package or a $label in rust-project.check.overrideCommand
+    Package(PackageSpecifier),
+}
+
+#[derive(Debug)]
+enum FlycheckCommandOrigin {
+    /// Regular cargo invocation
+    Cargo,
+    /// Configured via check_overrideCommand
+    CheckOverrideCommand,
+    /// From a runnable with [project_json::RunnableKind::Flycheck]
+    ProjectJsonRunnable,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PackageSpecifier {
+    Cargo {
+        /// The one in Cargo.toml, assumed to work with `cargo check -p {}` etc
+        ///
+        /// PackageData.name works.
+        cargo_canonical_name: String,
+        /// Ask cargo to build a specific --bin, --test, --bench
+        bin_target: Option<BinTarget>,
+    },
+    BuildInfo {
+        /// If a `build` field is present in rust-project.json, its label field
+        label: String,
+    },
+}
+
 enum StateChange {
-    Restart { package: Option<String>, saved_file: Option<AbsPathBuf>, target: Option<Target> },
+    Restart { package: PackageToRestart, saved_file: Option<AbsPathBuf> },
     Cancel,
 }
 
@@ -202,6 +335,8 @@ struct FlycheckActor {
     id: usize,
     sender: Sender<FlycheckMessage>,
     config: FlycheckConfig,
+    config_json: FlycheckConfigJson,
+    /// If we are flychecking a cargo workspace, this will point to the workspace Cargo.toml
     manifest_path: Option<AbsPathBuf>,
     /// Either the workspace root of the workspace we are flychecking,
     /// or the project root of the project.
@@ -232,13 +367,62 @@ enum FlycheckStatus {
     Finished,
 }
 
-pub(crate) const SAVED_FILE_PLACEHOLDER: &str = "$saved_file";
+/// This is stable behaviour. Don't change.
+const SAVED_FILE_PLACEHOLDER: &str = "$saved_file";
+const LABEL_INLINE: &str = "{label}";
+
+struct Substitutions<'a> {
+    label: Option<&'a str>,
+    saved_file: Option<&'a str>,
+}
+
+impl<'a> Substitutions<'a> {
+    /// If you have a runnable, and it has {label} in it somewhere, treat it as a template that
+    /// may be unsatisfied if you do not provide a label to substitute into it. Returns None in
+    /// that situation. Otherwise performs the requested substitutions.
+    ///
+    fn substitute(self, template: &project_json::Runnable) -> Option<Command> {
+        let mut cmd = Command::new(&template.program);
+        let mut label_satisfied = self.label.is_none();
+        let mut saved_file_satisfied = self.saved_file.is_none();
+        for arg in &template.args {
+            if let Some(ix) = arg.find(LABEL_INLINE) {
+                if let Some(label) = self.label {
+                    let mut arg = arg.to_string();
+                    arg.replace_range(ix..ix + LABEL_INLINE.len(), label);
+                    cmd.arg(arg);
+                    label_satisfied = true;
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+            if arg == SAVED_FILE_PLACEHOLDER {
+                if let Some(saved_file) = self.saved_file {
+                    cmd.arg(saved_file);
+                    saved_file_satisfied = true;
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+            cmd.arg(arg);
+        }
+        if label_satisfied && saved_file_satisfied {
+            cmd.current_dir(&template.cwd);
+            Some(cmd)
+        } else {
+            None
+        }
+    }
+}
 
 impl FlycheckActor {
     fn new(
         id: usize,
         sender: Sender<FlycheckMessage>,
         config: FlycheckConfig,
+        config_json: FlycheckConfigJson,
         sysroot_root: Option<AbsPathBuf>,
         workspace_root: AbsPathBuf,
         manifest_path: Option<AbsPathBuf>,
@@ -248,6 +432,7 @@ impl FlycheckActor {
             id,
             sender,
             config,
+            config_json,
             sysroot_root,
             root: workspace_root,
             manifest_path,
@@ -280,7 +465,7 @@ impl FlycheckActor {
                     tracing::debug!(flycheck_id = self.id, "flycheck cancelled");
                     self.cancel_check_process();
                 }
-                Event::RequestStateChange(StateChange::Restart { package, saved_file, target }) => {
+                Event::RequestStateChange(StateChange::Restart { package, saved_file }) => {
                     // Cancel the previously spawned process
                     self.cancel_check_process();
                     while let Ok(restart) = inbox.recv_timeout(Duration::from_millis(50)) {
@@ -290,27 +475,39 @@ impl FlycheckActor {
                         }
                     }
 
-                    let Some(command) =
-                        self.check_command(package.as_deref(), saved_file.as_deref(), target)
+                    let Some((command, origin)) =
+                        self.check_command(package.clone(), saved_file.as_deref())
                     else {
+                        tracing::debug!(?package, "failed to build flycheck command");
                         continue;
                     };
 
-                    let formatted_command = format!("{command:?}");
+                    let debug_command = format!("{command:?}");
+                    let user_facing_command = match origin {
+                        // Don't show all the --format=json-with-blah-blah args, just the simple
+                        // version
+                        FlycheckCommandOrigin::Cargo => self.config.to_string(),
+                        // show them the full command but pretty printed. advanced user
+                        FlycheckCommandOrigin::ProjectJsonRunnable
+                        | FlycheckCommandOrigin::CheckOverrideCommand => display_command(
+                            &command,
+                            Some(std::path::Path::new(self.root.as_path())),
+                        ),
+                    };
 
-                    tracing::debug!(?command, "will restart flycheck");
+                    tracing::debug!(?origin, ?command, "will restart flycheck");
                     let (sender, receiver) = unbounded();
                     match CommandHandle::spawn(command, sender) {
                         Ok(command_handle) => {
-                            tracing::debug!(command = formatted_command, "did restart flycheck");
+                            tracing::debug!(?origin, command = %debug_command, "did restart flycheck");
                             self.command_handle = Some(command_handle);
                             self.command_receiver = Some(receiver);
-                            self.report_progress(Progress::DidStart);
+                            self.report_progress(Progress::DidStart { user_facing_command });
                             self.status = FlycheckStatus::Started;
                         }
                         Err(error) => {
                             self.report_progress(Progress::DidFailToRestart(format!(
-                                "Failed to run the following command: {formatted_command} error={error}"
+                                "Failed to run the following command: {debug_command} origin={origin:?} error={error}"
                             )));
                             self.status = FlycheckStatus::Finished;
                         }
@@ -384,17 +581,68 @@ impl FlycheckActor {
         }
     }
 
+    fn explicit_check_command(
+        &self,
+        package: PackageToRestart,
+        saved_file: Option<&AbsPath>,
+    ) -> Option<Command> {
+        match package {
+            PackageToRestart::All => {
+                // If the template doesn't contain {label}, then it works for restarting all.
+                //
+                // Might be nice to have: self.config_json.workspace_template.as_ref().map(|x| x.to_command())
+                // But for now this works.
+                //
+                let template = self.config_json.single_template.as_ref()?;
+                let subs = Substitutions {
+                    label: None,
+                    saved_file: saved_file.map(|x| x.as_str()),
+                };
+                subs.substitute(template)
+            }
+            PackageToRestart::Package(
+                PackageSpecifier::BuildInfo { label }
+                // Treat missing build_info as implicitly setting label = the cargo canonical name
+                //
+                // Not sure what to do about --bin etc with custom override commands.
+                | PackageSpecifier::Cargo { cargo_canonical_name: label, bin_target: _ },
+            ) => {
+                let template = self.config_json.single_template.as_ref()?;
+                let subs = Substitutions {
+                    label: Some(&label),
+                    saved_file: saved_file.map(|x| x.as_str()),
+                };
+                subs.substitute(template)
+            }
+        }
+    }
+
+    fn cannot_run_workspace(&self) -> bool {
+        let fake_path = self.root.join("fake.rs");
+        self.check_command(PackageToRestart::All, Some(&fake_path)).is_none()
+    }
+
     /// Construct a `Command` object for checking the user's code. If the user
     /// has specified a custom command with placeholders that we cannot fill,
     /// return None.
     fn check_command(
         &self,
-        package: Option<&str>,
+        package: PackageToRestart,
         saved_file: Option<&AbsPath>,
-        target: Option<Target>,
-    ) -> Option<Command> {
+    ) -> Option<(Command, FlycheckCommandOrigin)> {
         match &self.config {
             FlycheckConfig::CargoCommand { command, options, ansi_color_output } => {
+                // Only use the rust-project.json's flycheck config when no check_overrideCommand
+                // is configured. In the other branch we will still do label substitution but on
+                // the overrideCommand instead.
+                if self.config_json.any_configured() {
+                    // Completely handle according to rust-project.json.
+                    // We don't consider this to be "using cargo" so we will not apply any of the
+                    // CargoOptions to the command.
+                    let cmd = self.explicit_check_command(package, saved_file)?;
+                    return Some((cmd, FlycheckCommandOrigin::ProjectJsonRunnable));
+                }
+
                 let mut cmd = Command::new(Tool::Cargo.path());
                 if let Some(sysroot_root) = &self.sysroot_root {
                     cmd.env("RUSTUP_TOOLCHAIN", AsRef::<std::path::Path>::as_ref(sysroot_root));
@@ -403,18 +651,25 @@ impl FlycheckActor {
                 cmd.current_dir(&self.root);
 
                 match package {
-                    Some(pkg) => cmd.arg("-p").arg(pkg),
-                    None => cmd.arg("--workspace"),
+                    PackageToRestart::Package(PackageSpecifier::Cargo {
+                        cargo_canonical_name,
+                        bin_target,
+                    }) => {
+                        cmd.arg("-p").arg(cargo_canonical_name);
+                        if let Some(tgt) = bin_target {
+                            tgt.append_cargo_arg(&mut cmd);
+                        }
+                    }
+                    PackageToRestart::Package(PackageSpecifier::BuildInfo { label: _ }) => {
+                        // No way to flycheck this single package. All we have is a build label.
+                        // There's no way to really say whether this build label happens to be
+                        // a cargo canonical name, so we won't try.
+                        return None;
+                    }
+                    PackageToRestart::All => {
+                        cmd.arg("--workspace");
+                    }
                 };
-
-                if let Some(tgt) = target {
-                    match tgt {
-                        Target::Bin(tgt) => cmd.arg("--bin").arg(tgt),
-                        Target::Example(tgt) => cmd.arg("--example").arg(tgt),
-                        Target::Test(tgt) => cmd.arg("--test").arg(tgt),
-                        Target::Benchmark(tgt) => cmd.arg("--bench").arg(tgt),
-                    };
-                }
 
                 cmd.arg(if *ansi_color_output {
                     "--message-format=json-diagnostic-rendered-ansi"
@@ -434,45 +689,43 @@ impl FlycheckActor {
 
                 options.apply_on_command(&mut cmd);
                 cmd.args(&options.extra_args);
-                Some(cmd)
+                Some((cmd, FlycheckCommandOrigin::Cargo))
             }
             FlycheckConfig::CustomCommand { command, args, extra_env, invocation_strategy } => {
                 let mut cmd = Command::new(command);
                 cmd.envs(extra_env);
-
-                match invocation_strategy {
-                    InvocationStrategy::Once => {
-                        cmd.current_dir(&self.root);
-                    }
+                let root = match invocation_strategy {
+                    InvocationStrategy::Once => self.root.as_path(),
                     InvocationStrategy::PerWorkspace => {
-                        // FIXME: cmd.current_dir(&affected_workspace);
-                        cmd.current_dir(&self.root);
+                        // FIXME: should run in the affected_workspace?
+                        self.root.as_path()
                     }
-                }
+                };
 
-                // If the custom command has a $saved_file placeholder, and
-                // we're saving a file, replace the placeholder in the arguments.
-                if let Some(saved_file) = saved_file {
-                    for arg in args {
-                        if arg == SAVED_FILE_PLACEHOLDER {
-                            cmd.arg(saved_file);
-                        } else {
-                            cmd.arg(arg);
-                        }
+                let runnable = project_json::Runnable {
+                    program: command.clone(),
+                    cwd: Utf8PathBuf::new(),
+                    args: args.clone(),
+                    kind: project_json::RunnableKind::Flycheck,
+                };
+
+                let label = match &package {
+                    PackageToRestart::All => None,
+                    PackageToRestart::Package(PackageSpecifier::BuildInfo { label }) => {
+                        Some(label.as_ref())
                     }
-                } else {
-                    for arg in args {
-                        if arg == SAVED_FILE_PLACEHOLDER {
-                            // The custom command has a $saved_file placeholder,
-                            // but we had an IDE event that wasn't a file save. Do nothing.
-                            return None;
-                        }
+                    PackageToRestart::Package(PackageSpecifier::Cargo {
+                        cargo_canonical_name,
+                        bin_target: _,
+                    }) => Some(cargo_canonical_name.as_ref()),
+                };
 
-                        cmd.arg(arg);
-                    }
-                }
+                let subs = Substitutions { label, saved_file: saved_file.map(|x| x.as_str()) };
+                let mut cmd = subs.substitute(&runnable)?;
+                cmd.envs(extra_env);
+                cmd.current_dir(root);
 
-                Some(cmd)
+                Some((cmd, FlycheckCommandOrigin::CheckOverrideCommand))
             }
         }
     }
@@ -524,4 +777,74 @@ impl ParseFromLine for CargoCheckMessage {
 enum JsonMessage {
     Cargo(cargo_metadata::Message),
     Rustc(Diagnostic),
+}
+
+/// Not good enough to execute in a shell, but good enough to show the user without all the noisy
+/// quotes
+fn display_command(c: &Command, implicit_cwd: Option<&std::path::Path>) -> String {
+    let mut o = String::new();
+    use std::fmt::Write;
+    let lossy = std::ffi::OsStr::to_string_lossy;
+    if let Some(dir) = c.get_current_dir() {
+        if Some(dir) == implicit_cwd.map(std::path::Path::new) {
+            // pass
+        } else if dir.to_string_lossy().contains(" ") {
+            write!(o, "cd {:?} && ", dir).unwrap();
+        } else {
+            write!(o, "cd {} && ", dir.display()).unwrap();
+        }
+    }
+    for (env, val) in c.get_envs() {
+        let (env, val) = (lossy(env), val.map(lossy).unwrap_or(std::borrow::Cow::Borrowed("")));
+        if env.contains(" ") {
+            write!(o, "\"{}={}\" ", env, val).unwrap();
+        } else if val.contains(" ") {
+            write!(o, "{}=\"{}\" ", env, val).unwrap();
+        } else {
+            write!(o, "{}={} ", env, val).unwrap();
+        }
+    }
+    let prog = lossy(c.get_program());
+    if prog.contains(" ") {
+        write!(o, "{:?}", prog).unwrap();
+    } else {
+        write!(o, "{}", prog).unwrap();
+    }
+    for arg in c.get_args() {
+        let arg = lossy(arg);
+        if arg.contains(" ") {
+            write!(o, " \"{}\"", arg).unwrap();
+        } else {
+            write!(o, " {}", arg).unwrap();
+        }
+    }
+    o
+}
+
+#[test]
+fn test_display_command() {
+    use std::path::Path;
+    let mut cmd = Command::new("command");
+    assert_eq!(display_command(cmd.arg("--arg"), None), "command --arg");
+    assert_eq!(display_command(cmd.arg("spaced arg"), None), "command --arg \"spaced arg\"");
+    assert_eq!(
+        display_command(cmd.env("ENVIRON", "yeah"), None),
+        "ENVIRON=yeah command --arg \"spaced arg\""
+    );
+    assert_eq!(
+        display_command(cmd.env("OTHER", "spaced env"), None),
+        "ENVIRON=yeah OTHER=\"spaced env\" command --arg \"spaced arg\""
+    );
+    assert_eq!(
+        display_command(cmd.current_dir("/tmp"), None),
+        "cd /tmp && ENVIRON=yeah OTHER=\"spaced env\" command --arg \"spaced arg\""
+    );
+    assert_eq!(
+        display_command(cmd.current_dir("/tmp and/thing"), None),
+        "cd \"/tmp and/thing\" && ENVIRON=yeah OTHER=\"spaced env\" command --arg \"spaced arg\""
+    );
+    assert_eq!(
+        display_command(cmd.current_dir("/tmp and/thing"), Some(Path::new("/tmp and/thing"))),
+        "ENVIRON=yeah OTHER=\"spaced env\" command --arg \"spaced arg\""
+    );
 }

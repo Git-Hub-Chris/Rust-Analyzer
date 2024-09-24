@@ -185,12 +185,11 @@ impl ProjectJson {
         &self.project_root
     }
 
-    pub fn crate_by_root(&self, root: &AbsPath) -> Option<Crate> {
+    pub fn crate_by_root(&self, root: &AbsPath) -> Option<&Crate> {
         self.crates
             .iter()
             .filter(|krate| krate.is_workspace_member)
             .find(|krate| krate.root_module == root)
-            .cloned()
     }
 
     /// Returns the path to the project's manifest, if it exists.
@@ -221,13 +220,17 @@ impl ProjectJson {
     pub fn runnables(&self) -> &[Runnable] {
         &self.runnables
     }
+
+    pub fn runnable_template(&self, kind: RunnableKind) -> Option<&Runnable> {
+        self.runnables().iter().find(|r| r.kind == kind)
+    }
 }
 
 /// A crate points to the root module of a crate and lists the dependencies of the crate. This is
 /// useful in creating the crate graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Crate {
-    pub(crate) display_name: Option<CrateDisplayName>,
+    pub display_name: Option<CrateDisplayName>,
     pub root_module: AbsPathBuf,
     pub(crate) edition: Edition,
     pub(crate) version: Option<String>,
@@ -321,6 +324,10 @@ pub enum RunnableKind {
 
     /// Run a single test.
     TestOne,
+
+    /// Template for checking a target, emitting rustc JSON diagnostics.
+    /// May include {label} which will get the label from the `build` section of a crate.
+    Flycheck,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -422,6 +429,7 @@ pub struct RunnableData {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunnableKindData {
+    Flycheck,
     Check,
     Run,
     TestOne,
@@ -492,6 +500,7 @@ impl From<RunnableKindData> for RunnableKind {
             RunnableKindData::Check => RunnableKind::Check,
             RunnableKindData::Run => RunnableKind::Run,
             RunnableKindData::TestOne => RunnableKind::TestOne,
+            RunnableKindData::Flycheck => RunnableKind::Flycheck,
         }
     }
 }

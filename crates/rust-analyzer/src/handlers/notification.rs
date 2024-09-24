@@ -3,6 +3,7 @@
 
 use std::ops::{Deref, Not as _};
 
+use ide::CrateId;
 use itertools::Itertools;
 use lsp_types::{
     CancelParams, DidChangeConfigurationParams, DidChangeTextDocumentParams,
@@ -10,13 +11,13 @@ use lsp_types::{
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, WorkDoneProgressCancelParams,
 };
 use paths::Utf8PathBuf;
-use stdx::TupleExt;
+use project_model::project_json;
 use triomphe::Arc;
 use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 
 use crate::{
     config::{Config, ConfigChange},
-    flycheck::Target,
+    flycheck::{self, BinTarget},
     global_state::{FetchWorkspaceRequest, GlobalState},
     lsp::{from_proto, utils::apply_document_changes},
     lsp_ext::{self, RunFlycheckParams},
@@ -296,41 +297,68 @@ fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
         let source_root_id = world.analysis.source_root_id(file_id).ok();
         let mut updated = false;
         let task = move || -> std::result::Result<(), ide::Cancelled> {
-            // Is the target binary? If so we let flycheck run only for the workspace that contains the crate.
-            let target = TargetSpec::for_file(&world, file_id)?.and_then(|it| {
-                let tgt_kind = it.target_kind();
-                let (tgt_name, crate_id) = match it {
-                    TargetSpec::Cargo(c) => (c.target, c.crate_id),
-                    TargetSpec::ProjectJson(p) => (p.label, p.crate_id),
-                };
+            #[derive(Debug)]
+            enum FlycheckScope {
+                /// Cargo workspace but user edited a binary target. There should be no
+                /// downstream crates. We let flycheck run only for the workspace that
+                /// contains the crate.
+                Binary { package_name: Option<String>, bin_target: BinTarget, crate_id: CrateId },
+                /// Limit flycheck to crates actually containing the file_id, because the user does not want to
+                /// flycheck with --workspace.
+                NoDownstream,
+                /// Run on any affected workspace
+                Workspace,
+            }
 
-                let tgt = match tgt_kind {
-                    project_model::TargetKind::Bin => Target::Bin(tgt_name),
-                    project_model::TargetKind::Example => Target::Example(tgt_name),
-                    project_model::TargetKind::Test => Target::Test(tgt_name),
-                    project_model::TargetKind::Bench => Target::Benchmark(tgt_name),
-                    _ => return None,
-                };
+            let scope = TargetSpec::for_file(&world, file_id)?
+                .map(|it| {
+                    let tgt_kind = it.target_kind();
+                    let (package_name, tgt_name, crate_id) = match it {
+                        TargetSpec::Cargo(c) => (Some(c.package), c.target, c.crate_id),
+                        TargetSpec::ProjectJson(p) => (None, p.label, p.crate_id),
+                    };
 
-                Some((tgt, crate_id))
-            });
+                    if let Some(bin_target) = BinTarget::from_target_kind(tgt_kind, tgt_name) {
+                        return FlycheckScope::Binary { package_name, bin_target, crate_id };
+                    }
+                    if !world.config.flycheck_workspace(source_root_id) {
+                        FlycheckScope::NoDownstream
+                    } else {
+                        FlycheckScope::Workspace
+                    }
+                })
+                // XXX: is this right?
+                .unwrap_or(FlycheckScope::Workspace);
 
-            let crate_ids = match target {
-                // Trigger flychecks for the only crate which the target belongs to
-                Some((_, krate)) => vec![krate],
-                None => {
+            tracing::debug!("flycheck scope: {:?}", scope);
+
+            let crate_ids = match scope {
+                FlycheckScope::Workspace => {
                     // Trigger flychecks for all workspaces that depend on the saved file
-                    // Crates containing or depending on the saved file
+                    // i.e. have crates containing or depending on the saved file
                     world
                         .analysis
                         .crates_for(file_id)?
                         .into_iter()
+                        // These are topologically sorted. So `id` is first.
                         .flat_map(|id| world.analysis.transitive_rev_deps(id))
+                        // FIXME: If there are multiple crates_for(file_id), once you flatten
+                        // multiple transitive_rev_deps, it's no longer guaranteed to be toposort.
                         .flatten()
                         .unique()
                         .collect::<Vec<_>>()
                 }
+                FlycheckScope::NoDownstream => {
+                    // Trigger flychecks in all workspaces, but only for the exact crate that has
+                    // this file, and not for any workspaces that don't have that file.
+                    world.analysis.crates_for(file_id)?
+                }
+                // Trigger flychecks for the only crate which the target belongs to
+                FlycheckScope::Binary { crate_id, .. } => {
+                    vec![crate_id]
+                }
             };
+
             let crate_root_paths: Vec<_> = crate_ids
                 .iter()
                 .filter_map(|&crate_id| {
@@ -352,20 +380,51 @@ fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                     | project_model::ProjectWorkspaceKind::DetachedFile {
                         cargo: Some((cargo, _, _)),
                         ..
-                    } => cargo.packages().find_map(|pkg| {
-                        let has_target_with_root = cargo[pkg]
-                            .targets
-                            .iter()
-                            .any(|&it| crate_root_paths.contains(&cargo[it].root.as_path()));
-                        has_target_with_root.then(|| cargo[pkg].name.clone())
-                    }),
+                    } => {
+                        // Iterate crate_root_paths first because it is in topological
+                        // order^[1], and we can therefore find the actual crate your saved
+                        // file was in rather than some random downstream dependency.
+                        // Thus with `[check] workspace = false` we can flycheck the
+                        // smallest number of crates (just A) instead of checking B and C
+                        // in response to every file save in A.
+                        //
+                        // A <- B <- C
+                        //
+                        // [1]: But see FIXME above where we flatten.
+                        crate_root_paths.iter().find_map(|root| {
+                            let target = cargo.target_by_root(root)?;
+                            let pkg = cargo[target].package;
+                            let pkg_name = cargo[pkg].name.clone();
+                            Some(flycheck::PackageSpecifier::Cargo {
+                                // This is very hacky. But we are iterating through a lot of
+                                // crates, many of which are reverse deps, and it doesn't make
+                                // sense to attach --bin XXX to some random downstream dep in a
+                                // different workspace.
+                                bin_target: match &scope {
+                                    FlycheckScope::Binary {
+                                        package_name: bin_pkg_name,
+                                        bin_target,
+                                        ..
+                                    } if bin_pkg_name.as_ref() == Some(&pkg_name)
+                                        && bin_target.name() == cargo[target].name =>
+                                    {
+                                        Some(bin_target.clone())
+                                    }
+                                    _ => None,
+                                },
+                                cargo_canonical_name: pkg_name,
+                            })
+                        })
+                    }
                     project_model::ProjectWorkspaceKind::Json(project) => {
-                        if !project.crates().any(|(_, krate)| {
-                            crate_root_paths.contains(&krate.root_module.as_path())
-                        }) {
-                            return None;
-                        }
-                        None
+                        let krate_flycheck = crate_root_paths.iter().find_map(|root| {
+                            let krate = project.crate_by_root(root)?;
+                            project_json_flycheck(project, krate)
+                        });
+
+                        // If there is no matching crate, returns None and doesn't hit this
+                        // workspace in the loop below.
+                        Some(krate_flycheck?)
                     }
                     project_model::ProjectWorkspaceKind::DetachedFile { .. } => return None,
                 };
@@ -379,14 +438,20 @@ fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                 for (id, package) in workspace_ids.clone() {
                     if id == flycheck.id() {
                         updated = true;
-                        match package.filter(|_| {
-                            !world.config.flycheck_workspace(source_root_id) || target.is_some()
+                        match package.filter(|spec| {
+                            // Any of these cases, and we can't flycheck the whole workspace.
+                            !world.config.flycheck_workspace(source_root_id)
+                                || flycheck.cannot_run_workspace()
+                                    // No point flychecking the whole workspace when you edited a
+                                    // main.rs. It cannot have dependencies.
+                                || matches!(
+                                    spec,
+                                    flycheck::PackageSpecifier::Cargo { bin_target: Some(_), .. }
+                                )
                         }) {
-                            Some(package) => flycheck
-                                .restart_for_package(package, target.clone().map(TupleExt::head)),
+                            Some(spec) => flycheck.restart_for_package(spec),
                             None => flycheck.restart_workspace(saved_file.clone()),
                         }
-                        continue;
                     }
                 }
             }
@@ -445,4 +510,23 @@ pub(crate) fn handle_abort_run_test(state: &mut GlobalState, _: ()) -> anyhow::R
         state.send_notification::<lsp_ext::EndRunTest>(());
     }
     Ok(())
+}
+
+fn project_json_flycheck(
+    _project_json: &project_json::ProjectJson,
+    krate: &project_json::Crate,
+) -> Option<flycheck::PackageSpecifier> {
+    if let Some(build_info) = krate.build.as_ref() {
+        let label = build_info.label.clone();
+        Some(flycheck::PackageSpecifier::BuildInfo { label })
+    } else {
+        // No build_info field, so assume this is built by cargo.
+        let cargo_canonical_name =
+            krate.display_name.as_ref().map(|x| x.canonical_name().to_owned())?.to_string();
+        Some(flycheck::PackageSpecifier::Cargo {
+            cargo_canonical_name,
+            // In JSON world, can we even describe crates that are checkable with `cargo check --bin XXX`?
+            bin_target: None,
+        })
+    }
 }
