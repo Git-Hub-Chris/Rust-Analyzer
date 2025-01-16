@@ -194,17 +194,28 @@ pub(crate) fn handle_view_item_tree(
     Ok(res)
 }
 
-// cargo test requires the real package name which might contain hyphens but
-// the test identifier passed to this function is the namespace form where hyphens
-// are replaced with underscores so we have to reverse this and find the real package name
-fn find_package_name(namespace_root: &str, cargo: &CargoWorkspace) -> Option<String> {
+// cargo test requires:
+// - the package name - the root of the test identifier supplied to this handler can be
+//   a package or a target inside a package.
+// - the target name - if the test identifier is a target, it's needed in addition to the
+//   package name to run the right test
+// - real names - the test identifier uses the namespace form where hyphens are replaced with
+//   underscores. cargo test requires the real name.
+// - the target kind e.g. bin or lib
+fn find_test_target(namespace_root: &str, cargo: &CargoWorkspace) -> Option<TestTarget> {
     cargo.packages().find_map(|p| {
         let package_name = &cargo[p].name;
-        if package_name.replace('-', "_") == namespace_root {
-            Some(package_name.clone())
-        } else {
-            None
+        for target in cargo[p].targets.iter() {
+            let target_name = &cargo[*target].name;
+            if target_name.replace('-', "_") == namespace_root {
+                return Some(TestTarget::Package {
+                    package: package_name.clone(),
+                    target: target_name.clone(),
+                    kind: cargo[*target].kind,
+                });
+            }
         }
+        None
     })
 }
 
@@ -245,8 +256,8 @@ pub(crate) fn handle_run_test(
     for ws in &*state.workspaces {
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &ws.kind {
             let test_target = if let Some(namespace_root) = namespace_root {
-                if let Some(package_name) = find_package_name(namespace_root, cargo) {
-                    TestTarget::Package(package_name)
+                if let Some(test_target) = find_test_target(namespace_root, cargo) {
+                    test_target
                 } else {
                     TestTarget::Workspace
                 }
